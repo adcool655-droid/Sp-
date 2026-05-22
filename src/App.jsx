@@ -144,7 +144,8 @@ export default function App() {
         throw new Error(err?.error_summary || `HTTP ${res.status}`);
       }
       const text = await res.text();
-      const json = JSON.parse(text);
+      const cleaned = text.replace(/^[^{]*/, "");
+      const json = JSON.parse(cleaned);
       const today = parseTodayTasks(json);
       setTasks(today);
       setLastSync(new Date());
