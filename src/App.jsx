@@ -39,12 +39,9 @@ function minsToHuman(ms) {
 // Parse SP JSON → today's tasks
 function parseTodayTasks(data) {
   try {
-    // SP stores "today" tasks under the TODAY tag (id: "TODAY") taskIds
-    // OR under task.plannedAt matching today's date
     const taskEntities = data?.task?.entities || data?.tasks?.entities || {};
     const tags = data?.tag?.entities || data?.tags?.entities || {};
 
-    // Find TODAY tag
     const todayTag = Object.values(tags).find(
       (t) => t.id === "TODAY" || t.title === "Today" || t.title === "TODAY"
     );
@@ -55,26 +52,34 @@ function parseTodayTasks(data) {
       todayTag.taskIds.forEach((id) => todayIds.add(id));
     }
 
-    // Also include tasks with timeSpentOnDay for today or plannedAt today
     const key = todayKey();
-    const todayStart = new Date(); todayStart.setHours(0,0,0,0);
-    const todayEnd = new Date(); todayEnd.setHours(23,59,59,999);
+    const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+    const todayEnd = new Date(); todayEnd.setHours(23, 59, 59, 999);
 
     Object.values(taskEntities).forEach((task) => {
+      // time logged today
       if (task.timeSpentOnDay?.[key]) todayIds.add(task.id);
+
+      // plannedAt scheduled today
       if (task.plannedAt) {
         const d = new Date(task.plannedAt);
         if (d >= todayStart && d <= todayEnd) todayIds.add(task.id);
       }
+
+      // dueDate scheduled today (SP also uses this field)
+      if (task.dueDate) {
+        const d = new Date(task.dueDate);
+        if (d >= todayStart && d <= todayEnd) todayIds.add(task.id);
+      }
+
       // tagIds includes TODAY
       if (task.tagIds?.includes("TODAY")) todayIds.add(task.id);
     });
 
-    // Build task list, skip subtasks (they'll show under parent)
     const tasks = [];
     todayIds.forEach((id) => {
       const t = taskEntities[id];
-      if (!t || t.parentId) return; // skip subtasks at top level
+      if (!t || t.parentId) return;
       const subtasks = (t.subTaskIds || [])
         .map((sid) => taskEntities[sid])
         .filter(Boolean);
@@ -87,7 +92,6 @@ function parseTodayTasks(data) {
     return [];
   }
 }
-
 // ─── Main Component ─────────────────────────────────────────────────────────
 export default function App() {
   const [token, setToken] = useState(() => {
