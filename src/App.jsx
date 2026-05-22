@@ -1,311 +1,420 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 
-const initialTasks = [];
+// ─── Dropbox OAuth Config ───────────────────────────────────────────────────
+// Uses Dropbox's token flow (no backend needed). User must create a Dropbox App
+// at https://www.dropbox.com/developers/apps with permission: files.content.read
+// and add this page's origin as a redirect URI.
+const DROPBOX_CLIENT_ID = "YOUR_DROPBOX_APP_KEY"; // <-- replaced by user
+const REDIRECT_URI = typeof window !== "undefined" ? window.location.href.split("#")[0] : "";
+const SP_FILE_PATH = "/Apps/super_productivity/sp_main.json";
 
-const PRIORITIES = {
-  high: { label: "High", color: "#ff4757", bg: "#ff475715" },
-  medium: { label: "Medium", color: "#ffa502", bg: "#ffa50215" },
-  low: { label: "Low", color: "#2ed573", bg: "#2ed57315" },
-};
+// ─── Helpers ────────────────────────────────────────────────────────────────
+function getTokenFromHash() {
+  if (typeof window === "undefined") return null;
+  const hash = window.location.hash.substring(1);
+  const params = Object.fromEntries(new URLSearchParams(hash));
+  return params.access_token || null;
+}
 
-function useTime() {
-  const [now, setNow] = useState(new Date());
-  useEffect(() => {
-    const t = setInterval(() => setNow(new Date()), 1000);
-    return () => clearInterval(t);
-  }, []);
-  return now;
+function todayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}_${String(d.getMonth() + 1).padStart(2, "0")}_${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function formatDate() {
+  return new Date().toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
 }
 
 function formatTime(d) {
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
-function formatDate(d) {
-  return d.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
+  return new Date(d).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-export default function App() {
-  const [tasks, setTasks] = useState(initialTasks);
-  const [input, setInput] = useState("");
-  const [priority, setPriority] = useState("medium");
-  const [showPanel, setShowPanel] = useState(false);
-  const [notif, setNotif] = useState(null);
-  const [shake, setShake] = useState(false);
-  const now = useTime();
-  const notifRef = useRef(null);
+function minsToHuman(ms) {
+  if (!ms) return null;
+  const m = Math.round(ms / 60000);
+  if (m < 60) return `${m}m`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
 
-  const done = tasks.filter((t) => t.done).length;
-  const total = tasks.length;
-  const progress = total === 0 ? 0 : Math.round((done / total) * 100);
+// Parse SP JSON → today's tasks
+function parseTodayTasks(data) {
+  try {
+    // SP stores "today" tasks under the TODAY tag (id: "TODAY") taskIds
+    // OR under task.plannedAt matching today's date
+    const taskEntities = data?.task?.entities || data?.tasks?.entities || {};
+    const tags = data?.tag?.entities || data?.tags?.entities || {};
 
-  function addTask() {
-    const trimmed = input.trim();
-    if (!trimmed) {
-      setShake(true);
-      setTimeout(() => setShake(false), 500);
-      return;
-    }
-    const task = { id: Date.now(), text: trimmed, priority, done: false, addedAt: new Date() };
-    setTasks((prev) => [...prev, task]);
-    setInput("");
-    triggerNotif(`Task added: "${trimmed}"`);
-  }
-
-  function toggleTask(id) {
-    setTasks((prev) =>
-      prev.map((t) => {
-        if (t.id !== id) return t;
-        const updated = { ...t, done: !t.done };
-        if (updated.done) triggerNotif(`✓ Completed: "${t.text}"`);
-        return updated;
-      })
+    // Find TODAY tag
+    const todayTag = Object.values(tags).find(
+      (t) => t.id === "TODAY" || t.title === "Today" || t.title === "TODAY"
     );
+
+    let todayIds = new Set();
+
+    if (todayTag?.taskIds) {
+      todayTag.taskIds.forEach((id) => todayIds.add(id));
+    }
+
+    // Also include tasks with timeSpentOnDay for today or plannedAt today
+    const key = todayKey();
+    const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+    const todayEnd = new Date(); todayEnd.setHours(23,59,59,999);
+
+    Object.values(taskEntities).forEach((task) => {
+      if (task.timeSpentOnDay?.[key]) todayIds.add(task.id);
+      if (task.plannedAt) {
+        const d = new Date(task.plannedAt);
+        if (d >= todayStart && d <= todayEnd) todayIds.add(task.id);
+      }
+      // tagIds includes TODAY
+      if (task.tagIds?.includes("TODAY")) todayIds.add(task.id);
+    });
+
+    // Build task list, skip subtasks (they'll show under parent)
+    const tasks = [];
+    todayIds.forEach((id) => {
+      const t = taskEntities[id];
+      if (!t || t.parentId) return; // skip subtasks at top level
+      const subtasks = (t.subTaskIds || [])
+        .map((sid) => taskEntities[sid])
+        .filter(Boolean);
+      tasks.push({ ...t, subtasks });
+    });
+
+    return tasks;
+  } catch (e) {
+    console.error("Parse error", e);
+    return [];
+  }
+}
+
+// ─── Main Component ─────────────────────────────────────────────────────────
+export default function App() {
+  const [token, setToken] = useState(() => {
+    if (typeof window === "undefined") return null;
+    return sessionStorage.getItem("dbx_token") || getTokenFromHash();
+  });
+  const [appKey, setAppKey] = useState(() =>
+    typeof window !== "undefined" ? (localStorage.getItem("dbx_app_key") || "") : ""
+  );
+  const [tasks, setTasks] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [lastSync, setLastSync] = useState(null);
+  const [expanded, setExpanded] = useState({});
+  const [showSetup, setShowSetup] = useState(false);
+  const intervalRef = useRef(null);
+
+  // Persist token
+  useEffect(() => {
+    if (token) {
+      sessionStorage.setItem("dbx_token", token);
+      // Clean URL hash
+      if (window.location.hash.includes("access_token")) {
+        window.history.replaceState(null, "", window.location.pathname);
+      }
+    }
+  }, [token]);
+
+  // Check hash on load
+  useEffect(() => {
+    const t = getTokenFromHash();
+    if (t) setToken(t);
+  }, []);
+
+  const fetchTasks = useCallback(async (t = token) => {
+    if (!t) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch("https://content.dropboxapi.com/2/files/download", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${t}`,
+          "Dropbox-API-Arg": JSON.stringify({ path: SP_FILE_PATH }),
+        },
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        if (res.status === 401) { setToken(null); sessionStorage.removeItem("dbx_token"); throw new Error("Session expired. Please reconnect."); }
+        throw new Error(err?.error_summary || `HTTP ${res.status}`);
+      }
+      const json = await res.json();
+      const today = parseTodayTasks(json);
+      setTasks(today);
+      setLastSync(new Date());
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [token]);
+
+  // Auto-refresh every 5 min
+  useEffect(() => {
+    if (!token) return;
+    fetchTasks();
+    intervalRef.current = setInterval(() => fetchTasks(), 5 * 60 * 1000);
+    return () => clearInterval(intervalRef.current);
+  }, [token, fetchTasks]);
+
+  function connectDropbox() {
+    const key = appKey.trim();
+    if (!key) { setError("Please enter your Dropbox App Key first."); return; }
+    localStorage.setItem("dbx_app_key", key);
+    const url = `https://www.dropbox.com/oauth2/authorize?client_id=${key}&response_type=token&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`;
+    window.location.href = url;
   }
 
-  function removeTask(id) {
-    setTasks((prev) => prev.filter((t) => t.id !== id));
-  }
-
-  function triggerNotif(msg) {
-    clearTimeout(notifRef.current);
-    setNotif(msg);
-    notifRef.current = setTimeout(() => setNotif(null), 3000);
+  function disconnect() {
+    setToken(null);
+    setTasks([]);
+    sessionStorage.removeItem("dbx_token");
   }
 
   function sendBrowserNotif() {
-    if (!("Notification" in window)) return alert("Browser notifications not supported.");
+    if (!("Notification" in window)) return;
     Notification.requestPermission().then((p) => {
-      if (p === "granted") {
-        const pending = tasks.filter((t) => !t.done);
-        const body =
-          pending.length === 0
-            ? "🎉 All tasks complete!"
-            : pending.map((t) => `• ${t.text}`).join("\n");
-        new Notification("Today's Tasks — Super Productivity", { body, icon: "" });
-      } else {
-        alert("Notification permission denied.");
-      }
+      if (p !== "granted") return;
+      const pending = tasks.filter((t) => !t.isDone);
+      const body = pending.length === 0
+        ? "🎉 All tasks complete for today!"
+        : pending.map((t) => `• ${t.title}`).join("\n");
+      new Notification("Today's Tasks — Super Productivity", { body });
     });
   }
 
-  const sorted = [...tasks].sort((a, b) => {
-    const order = { high: 0, medium: 1, low: 2 };
-    if (a.done !== b.done) return a.done ? 1 : -1;
-    return order[a.priority] - order[b.priority];
-  });
+  const done = tasks.filter((t) => t.isDone).length;
+  const total = tasks.length;
+  const pct = total === 0 ? 0 : Math.round((done / total) * 100);
+
+  // ── Screens ────────────────────────────────────────────────────────────────
+  if (!token) {
+    return (
+      <Shell>
+        <div style={s.setupCard}>
+          <div style={s.logo}>⚡</div>
+          <h1 style={s.title}>SP Task Notifier</h1>
+          <p style={s.subtitle}>Connect your Dropbox to auto-load today's tasks from Super Productivity.</p>
+
+          <div style={s.steps}>
+            <Step n="1" text="Create a Dropbox App at dropbox.com/developers/apps" link="https://www.dropbox.com/developers/apps" />
+            <Step n="2" text='Set permission "files.content.read" and add this page URL as a redirect URI' />
+            <Step n="3" text="Paste your App Key below and connect" />
+          </div>
+
+          <input
+            style={s.input}
+            placeholder="Dropbox App Key"
+            value={appKey}
+            onChange={(e) => setAppKey(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && connectDropbox()}
+          />
+          {error && <div style={s.errorMsg}>{error}</div>}
+          <button style={s.connectBtn} onClick={connectDropbox}>
+            Connect Dropbox →
+          </button>
+        </div>
+        <Styles />
+      </Shell>
+    );
+  }
 
   return (
-    <div style={styles.root}>
-      {/* Background noise/grain */}
-      <div style={styles.grain} />
-
-      {/* Floating notification toast */}
-      <div style={{ ...styles.toast, opacity: notif ? 1 : 0, transform: notif ? "translateY(0)" : "translateY(-16px)" }}>
-        {notif}
-      </div>
-
-      <div style={styles.card}>
+    <Shell>
+      <div style={s.card}>
         {/* Header */}
-        <div style={styles.header}>
+        <div style={s.header}>
           <div>
-            <div style={styles.dateLabel}>{formatDate(now)}</div>
-            <div style={styles.clock}>{formatTime(now)}</div>
+            <div style={s.dateStr}>{formatDate()}</div>
+            <div style={s.headline}>Today's Focus</div>
           </div>
-          <div style={styles.headerRight}>
-            <button style={styles.iconBtn} title="Send browser notification" onClick={sendBrowserNotif}>
-              🔔
-            </button>
-            <button style={styles.iconBtn} title="Add tasks" onClick={() => setShowPanel((v) => !v)}>
-              {showPanel ? "✕" : "+"}
-            </button>
+          <div style={s.headerActions}>
+            <IconBtn title="Send browser notification" onClick={sendBrowserNotif}>🔔</IconBtn>
+            <IconBtn title="Refresh" onClick={() => fetchTasks()} disabled={loading}>
+              <span style={{ display: "inline-block", animation: loading ? "spin 1s linear infinite" : "none" }}>↻</span>
+            </IconBtn>
+            <IconBtn title="Disconnect" onClick={disconnect}>⏏</IconBtn>
           </div>
         </div>
 
-        {/* Progress bar */}
-        <div style={styles.progressWrap}>
-          <div style={styles.progressTrack}>
-            <div style={{ ...styles.progressFill, width: `${progress}%` }} />
+        {/* Progress */}
+        <div style={s.progressArea}>
+          <div style={s.progressTrack}>
+            <div style={{ ...s.progressFill, width: `${pct}%` }} />
           </div>
-          <span style={styles.progressLabel}>
-            {done}/{total} done
-            {progress === 100 && total > 0 ? " 🎉" : ""}
-          </span>
+          <div style={s.progressMeta}>
+            <span style={s.progressLabel}>{done} of {total} done {pct === 100 && total > 0 ? "🎉" : ""}</span>
+            {lastSync && <span style={s.syncTime}>synced {formatTime(lastSync)}</span>}
+          </div>
         </div>
 
-        {/* Add task panel */}
-        {showPanel && (
-          <div style={styles.addPanel}>
-            <input
-              style={{ ...styles.input, animation: shake ? "shake 0.4s" : "none" }}
-              placeholder="New task…"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && addTask()}
-              autoFocus
-            />
-            <div style={styles.priorityRow}>
-              {Object.entries(PRIORITIES).map(([key, val]) => (
-                <button
-                  key={key}
-                  style={{
-                    ...styles.priorityBtn,
-                    background: priority === key ? val.color : "transparent",
-                    color: priority === key ? "#fff" : val.color,
-                    border: `1.5px solid ${val.color}`,
-                  }}
-                  onClick={() => setPriority(key)}
-                >
-                  {val.label}
-                </button>
-              ))}
-              <button style={styles.addBtn} onClick={addTask}>Add</button>
-            </div>
-          </div>
-        )}
+        {/* Error */}
+        {error && <div style={s.errorMsg}>{error}</div>}
 
         {/* Task list */}
-        <div style={styles.taskList}>
-          {sorted.length === 0 && (
-            <div style={styles.empty}>No tasks yet — click <b>+</b> to add some.</div>
+        <div style={s.taskList}>
+          {loading && tasks.length === 0 && (
+            <div style={s.emptyState}>
+              <div style={s.spinner} />
+              <span>Loading from Dropbox…</span>
+            </div>
           )}
-          {sorted.map((task) => {
-            const p = PRIORITIES[task.priority];
-            return (
-              <div key={task.id} style={{ ...styles.taskRow, background: task.done ? "#ffffff08" : p.bg }}>
-                <button style={styles.checkBtn} onClick={() => toggleTask(task.id)}>
-                  <span style={{
-                    ...styles.checkCircle,
-                    borderColor: task.done ? p.color : "#555",
-                    background: task.done ? p.color : "transparent",
-                  }}>
-                    {task.done && <span style={styles.checkMark}>✓</span>}
-                  </span>
-                </button>
-                <span style={{ ...styles.taskText, textDecoration: task.done ? "line-through" : "none", color: task.done ? "#555" : "#e0e0e0" }}>
-                  {task.text}
-                </span>
-                <span style={{ ...styles.priorityDot, background: p.color }} title={p.label} />
-                <button style={styles.removeBtn} onClick={() => removeTask(task.id)}>✕</button>
-              </div>
-            );
-          })}
+          {!loading && tasks.length === 0 && !error && (
+            <div style={s.emptyState}>
+              <div style={{ fontSize: 32, marginBottom: 8 }}>✨</div>
+              <span>No tasks scheduled for today.</span>
+            </div>
+          )}
+          {tasks
+            .sort((a, b) => (a.isDone === b.isDone ? 0 : a.isDone ? 1 : -1))
+            .map((task) => (
+              <TaskRow
+                key={task.id}
+                task={task}
+                expanded={expanded[task.id]}
+                onToggle={() => setExpanded((e) => ({ ...e, [task.id]: !e[task.id] }))}
+              />
+            ))}
         </div>
 
-        <div style={styles.footer}>Super Productivity · Daily Focus</div>
+        <div style={s.footer}>
+          Super Productivity × Dropbox · auto-refreshes every 5 min
+        </div>
       </div>
+      <Styles />
+    </Shell>
+  );
+}
 
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { background: #0d0d0d; }
-        @keyframes shake {
-          0%,100% { transform: translateX(0); }
-          20% { transform: translateX(-6px); }
-          40% { transform: translateX(6px); }
-          60% { transform: translateX(-4px); }
-          80% { transform: translateX(4px); }
-        }
-        @keyframes fadeIn {
-          from { opacity: 0; transform: translateY(10px); }
-          to   { opacity: 1; transform: translateY(0); }
-        }
-      `}</style>
+function TaskRow({ task, expanded, onToggle }) {
+  const hasSubtasks = task.subtasks?.length > 0;
+  const doneSubs = task.subtasks?.filter((s) => s.isDone).length || 0;
+  const estimate = minsToHuman(task.timeEstimate);
+  const spent = minsToHuman(task.timeSpent);
+
+  return (
+    <div style={{ ...s.taskRow, opacity: task.isDone ? 0.5 : 1 }}>
+      <div style={s.taskMain}>
+        <div style={{ ...s.check, background: task.isDone ? "#4ade80" : "transparent", borderColor: task.isDone ? "#4ade80" : "#3a3a3a" }}>
+          {task.isDone && <span style={{ color: "#000", fontSize: 10, fontWeight: 800 }}>✓</span>}
+        </div>
+        <span style={{ ...s.taskTitle, textDecoration: task.isDone ? "line-through" : "none" }}>
+          {task.title}
+        </span>
+        <div style={s.taskMeta}>
+          {estimate && <span style={s.pill}>{estimate}</span>}
+          {spent && <span style={{ ...s.pill, background: "#1a2a1a", color: "#4ade80" }}>{spent} spent</span>}
+          {hasSubtasks && (
+            <button style={s.subBtn} onClick={onToggle}>
+              {doneSubs}/{task.subtasks.length} {expanded ? "▲" : "▼"}
+            </button>
+          )}
+        </div>
+      </div>
+      {expanded && hasSubtasks && (
+        <div style={s.subtaskList}>
+          {task.subtasks.map((sub) => (
+            <div key={sub.id} style={s.subtaskRow}>
+              <div style={{ ...s.check, width: 14, height: 14, background: sub.isDone ? "#4ade80" : "transparent", borderColor: sub.isDone ? "#4ade80" : "#333" }}>
+                {sub.isDone && <span style={{ color: "#000", fontSize: 8, fontWeight: 800 }}>✓</span>}
+              </div>
+              <span style={{ ...s.taskTitle, fontSize: 12, color: "#888", textDecoration: sub.isDone ? "line-through" : "none" }}>{sub.title}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
 
-const styles = {
-  root: {
-    minHeight: "100vh",
-    background: "#0d0d0d",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    fontFamily: "'Syne', sans-serif",
-    padding: "24px",
-    position: "relative",
-    overflow: "hidden",
-  },
-  grain: {
-    position: "fixed", inset: 0, pointerEvents: "none", zIndex: 0,
-    backgroundImage: "url(\"data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4'%3E%3C/feTurbulence%3E%3CfeDisplacementMap in='SourceGraphic' scale='80'%3E%3C/feDisplacementMap%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23n)'/%3E%3C/svg%3E\")",
-    backgroundSize: "200px 200px", opacity: 0.4,
-  },
-  toast: {
-    position: "fixed", top: 20, left: "50%", transform: "translateX(-50%)",
-    background: "#1e1e1e", color: "#e0e0e0", border: "1px solid #333",
-    padding: "10px 20px", borderRadius: "999px", fontSize: "13px",
-    fontFamily: "'JetBrains Mono', monospace", zIndex: 999,
-    transition: "opacity 0.3s, transform 0.3s", pointerEvents: "none",
-    whiteSpace: "nowrap",
-  },
-  card: {
-    position: "relative", zIndex: 1,
-    background: "#141414",
-    border: "1px solid #282828",
-    borderRadius: "20px",
-    padding: "28px",
-    width: "100%", maxWidth: "460px",
-    boxShadow: "0 32px 80px rgba(0,0,0,0.6)",
-    animation: "fadeIn 0.5s ease both",
-  },
-  header: {
-    display: "flex", justifyContent: "space-between", alignItems: "flex-start",
-    marginBottom: "20px",
-  },
-  dateLabel: { color: "#666", fontSize: "12px", letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: "2px" },
-  clock: { fontFamily: "'JetBrains Mono', monospace", fontSize: "28px", fontWeight: 500, color: "#f0f0f0", letterSpacing: "-0.02em" },
-  headerRight: { display: "flex", gap: "8px" },
-  iconBtn: {
-    background: "#1e1e1e", border: "1px solid #333", color: "#aaa",
-    borderRadius: "10px", width: "36px", height: "36px",
-    fontSize: "16px", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
-    transition: "background 0.2s, color 0.2s",
-  },
-  progressWrap: { marginBottom: "20px" },
-  progressTrack: { height: "4px", background: "#222", borderRadius: "4px", overflow: "hidden", marginBottom: "6px" },
-  progressFill: { height: "100%", background: "linear-gradient(90deg, #ff6b35, #ffd23f)", borderRadius: "4px", transition: "width 0.4s ease" },
-  progressLabel: { fontSize: "11px", color: "#555", fontFamily: "'JetBrains Mono', monospace" },
-  addPanel: {
-    background: "#1a1a1a", border: "1px solid #2a2a2a",
-    borderRadius: "12px", padding: "14px", marginBottom: "16px",
-    animation: "fadeIn 0.25s ease both",
-  },
-  input: {
-    width: "100%", background: "#111", border: "1px solid #333", color: "#e0e0e0",
-    borderRadius: "8px", padding: "10px 12px", fontSize: "14px",
-    fontFamily: "'Syne', sans-serif", outline: "none", marginBottom: "10px",
-  },
-  priorityRow: { display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" },
-  priorityBtn: {
-    padding: "5px 12px", borderRadius: "6px", fontSize: "12px", fontWeight: 600,
-    cursor: "pointer", transition: "all 0.15s", fontFamily: "'Syne', sans-serif",
-  },
-  addBtn: {
-    marginLeft: "auto", background: "#ff6b35", color: "#fff", border: "none",
-    borderRadius: "8px", padding: "6px 16px", fontSize: "13px", fontWeight: 700,
-    cursor: "pointer", fontFamily: "'Syne', sans-serif",
-  },
-  taskList: { display: "flex", flexDirection: "column", gap: "6px", minHeight: "60px" },
-  empty: { color: "#444", fontSize: "13px", textAlign: "center", padding: "24px 0", fontStyle: "italic" },
-  taskRow: {
-    display: "flex", alignItems: "center", gap: "10px",
-    padding: "10px 12px", borderRadius: "10px",
-    transition: "background 0.2s", animation: "fadeIn 0.2s ease both",
-  },
-  checkBtn: { background: "none", border: "none", cursor: "pointer", padding: 0, flexShrink: 0 },
-  checkCircle: {
-    width: "18px", height: "18px", borderRadius: "50%", border: "2px solid",
-    display: "flex", alignItems: "center", justifyContent: "center",
-    transition: "all 0.2s",
-  },
-  checkMark: { color: "#fff", fontSize: "10px", fontWeight: 700 },
-  taskText: { flex: 1, fontSize: "14px", lineHeight: "1.4", transition: "all 0.2s" },
-  priorityDot: { width: "6px", height: "6px", borderRadius: "50%", flexShrink: 0 },
-  removeBtn: {
-    background: "none", border: "none", color: "#444", cursor: "pointer",
-    fontSize: "12px", padding: "2px 4px", flexShrink: 0,
-    transition: "color 0.2s",
-  },
-  footer: { textAlign: "center", color: "#333", fontSize: "10px", letterSpacing: "0.1em", marginTop: "20px", textTransform: "uppercase" },
+function Step({ n, text, link }) {
+  return (
+    <div style={s.step}>
+      <div style={s.stepN}>{n}</div>
+      <div style={s.stepText}>
+        {link ? <a href={link} target="_blank" rel="noreferrer" style={{ color: "#f59e0b", textDecoration: "underline" }}>{text}</a> : text}
+      </div>
+    </div>
+  );
+}
+
+function Shell({ children }) {
+  return (
+    <div style={s.root}>
+      <div style={s.bg} />
+      {children}
+    </div>
+  );
+}
+
+function IconBtn({ children, onClick, title, disabled }) {
+  return (
+    <button style={{ ...s.iconBtn, opacity: disabled ? 0.5 : 1 }} onClick={onClick} title={title} disabled={disabled}>
+      {children}
+    </button>
+  );
+}
+
+function Styles() {
+  return (
+    <style>{`
+      @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,600;1,9..144,300&display=swap');
+      *{box-sizing:border-box;margin:0;padding:0}
+      body{background:#0a0a0a}
+      @keyframes spin{to{transform:rotate(360deg)}}
+      @keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+    `}</style>
+  );
+}
+
+// ─── Styles ──────────────────────────────────────────────────────────────────
+const s = {
+  root: { minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#0a0a0a", fontFamily: "'DM Mono', monospace", padding: 24, position: "relative" },
+  bg: { position: "fixed", inset: 0, background: "radial-gradient(ellipse 60% 40% at 50% 0%, #1a0f0020 0%, transparent 70%)", pointerEvents: "none" },
+
+  // Setup
+  setupCard: { position: "relative", zIndex: 1, background: "#111", border: "1px solid #222", borderRadius: 20, padding: "40px 36px", width: "100%", maxWidth: 460, animation: "fadeUp .4s ease both" },
+  logo: { fontSize: 40, marginBottom: 16 },
+  title: { fontFamily: "'Fraunces', serif", fontSize: 28, fontWeight: 600, color: "#f5f0e8", marginBottom: 8 },
+  subtitle: { color: "#666", fontSize: 13, lineHeight: 1.6, marginBottom: 28 },
+  steps: { display: "flex", flexDirection: "column", gap: 12, marginBottom: 28 },
+  step: { display: "flex", gap: 12, alignItems: "flex-start" },
+  stepN: { background: "#f59e0b", color: "#000", borderRadius: "50%", width: 22, height: 22, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, flexShrink: 0, marginTop: 1 },
+  stepText: { color: "#999", fontSize: 12, lineHeight: 1.5 },
+  input: { width: "100%", background: "#0d0d0d", border: "1px solid #2a2a2a", color: "#f5f0e8", borderRadius: 10, padding: "12px 14px", fontSize: 13, fontFamily: "'DM Mono', monospace", outline: "none", marginBottom: 12 },
+  connectBtn: { width: "100%", background: "#f59e0b", color: "#000", border: "none", borderRadius: 10, padding: "13px 0", fontSize: 14, fontWeight: 700, cursor: "pointer", fontFamily: "'DM Mono', monospace", letterSpacing: "0.04em" },
+  errorMsg: { background: "#1a0808", border: "1px solid #3a1010", color: "#f87171", borderRadius: 8, padding: "10px 14px", fontSize: 12, marginBottom: 12 },
+
+  // Main card
+  card: { position: "relative", zIndex: 1, background: "#111", border: "1px solid #1e1e1e", borderRadius: 20, padding: "28px 28px 20px", width: "100%", maxWidth: 480, animation: "fadeUp .4s ease both" },
+  header: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 20 },
+  dateStr: { color: "#555", fontSize: 11, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 4 },
+  headline: { fontFamily: "'Fraunces', serif", fontSize: 26, color: "#f5f0e8", fontWeight: 300, fontStyle: "italic" },
+  headerActions: { display: "flex", gap: 6 },
+  iconBtn: { background: "#181818", border: "1px solid #2a2a2a", color: "#888", borderRadius: 9, width: 34, height: 34, fontSize: 15, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" },
+
+  // Progress
+  progressArea: { marginBottom: 20 },
+  progressTrack: { height: 3, background: "#1e1e1e", borderRadius: 3, overflow: "hidden", marginBottom: 6 },
+  progressFill: { height: "100%", background: "linear-gradient(90deg, #f59e0b, #fcd34d)", borderRadius: 3, transition: "width .5s ease" },
+  progressMeta: { display: "flex", justifyContent: "space-between" },
+  progressLabel: { color: "#666", fontSize: 11, fontFamily: "'DM Mono', monospace" },
+  syncTime: { color: "#333", fontSize: 11 },
+
+  // Tasks
+  taskList: { display: "flex", flexDirection: "column", gap: 2, minHeight: 60 },
+  emptyState: { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: "#444", fontSize: 13, padding: "32px 0", gap: 8 },
+  spinner: { width: 20, height: 20, border: "2px solid #222", borderTopColor: "#f59e0b", borderRadius: "50%", animation: "spin .8s linear infinite" },
+  taskRow: { borderRadius: 10, padding: "10px 12px", transition: "background .15s", background: "#0d0d0d" },
+  taskMain: { display: "flex", alignItems: "center", gap: 10 },
+  check: { width: 18, height: 18, borderRadius: "50%", border: "1.5px solid", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, transition: "all .2s" },
+  taskTitle: { flex: 1, fontSize: 13, color: "#d4cfc8", lineHeight: 1.4 },
+  taskMeta: { display: "flex", gap: 5, alignItems: "center", flexShrink: 0 },
+  pill: { background: "#1a1a1a", color: "#666", fontSize: 10, padding: "2px 7px", borderRadius: 99, border: "1px solid #2a2a2a" },
+  subBtn: { background: "none", border: "none", color: "#555", fontSize: 10, cursor: "pointer", fontFamily: "'DM Mono', monospace" },
+  subtaskList: { paddingLeft: 28, paddingTop: 8, display: "flex", flexDirection: "column", gap: 5 },
+  subtaskRow: { display: "flex", alignItems: "center", gap: 8 },
+
+  footer: { textAlign: "center", color: "#2a2a2a", fontSize: 10, letterSpacing: "0.08em", marginTop: 20, textTransform: "uppercase" },
 };
