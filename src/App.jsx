@@ -75,6 +75,14 @@ function parseTodayTasks(data) {
       // tagIds includes TODAY
       if (task.tagIds?.includes("TODAY")) todayIds.add(task.id);
     });
+    // tagIds includes TODAY
+      if (task.tagIds?.includes("TODAY")) todayIds.add(task.id);
+      // dueDay field (YYYY-MM-DD format)
+      if (task.dueDay) {
+        const today = new Date();
+        const todayStr = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+        if (task.dueDay === todayStr) todayIds.add(task.id);
+      }
 
     const tasks = [];
     todayIds.forEach((id) => {
