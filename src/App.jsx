@@ -6,7 +6,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 // and add this page's origin as a redirect URI.
 const DROPBOX_CLIENT_ID = "YOUR_DROPBOX_APP_KEY"; // <-- replaced by user
 const REDIRECT_URI = typeof window !== "undefined" ? window.location.href.split("#")[0] : "";
-const SP_FILE_PATH = "/Apps/super_productivity/sync-data.json";
+const SP_FILE_PATH = "/sync-data.json";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 function getTokenFromHash() {
