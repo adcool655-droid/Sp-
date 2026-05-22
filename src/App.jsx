@@ -143,7 +143,8 @@ export default function App() {
         if (res.status === 401) { setToken(null); sessionStorage.removeItem("dbx_token"); throw new Error("Session expired. Please reconnect."); }
         throw new Error(err?.error_summary || `HTTP ${res.status}`);
       }
-      const json = await res.json();
+      const text = await res.text();
+      const json = JSON.parse(text);
       const today = parseTodayTasks(json);
       setTasks(today);
       setLastSync(new Date());
